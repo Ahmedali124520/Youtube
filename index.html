@@ -1,0 +1,309 @@
+import os
+import time
+import threading
+import shutil
+import re
+from flask import Flask, request, send_file, render_template_string
+import yt_dlp
+
+app = Flask(__name__)
+app.config['DOWNLOAD_FOLDER'] = 'downloads'
+app.config['MAX_FILE_AGE'] = 600  # 10 minutes in seconds
+
+# Create downloads folder if not exists
+os.makedirs(app.config['DOWNLOAD_FOLDER'], exist_ok=True)
+
+def clean_old_files():
+    """Delete files older than MAX_FILE_AGE"""
+    while True:
+        time.sleep(60)  # Run every minute
+        now = time.time()
+        for filename in os.listdir(app.config['DOWNLOAD_FOLDER']):
+            file_path = os.path.join(app.config['DOWNLOAD_FOLDER'], filename)
+            if os.path.isfile(file_path):
+                file_age = now - os.path.getmtime(file_path)
+                if file_age > app.config['MAX_FILE_AGE']:
+                    try:
+                        os.remove(file_path)
+                        print(f"Deleted old file: {filename}")
+                    except Exception as e:
+                        print(f"Error deleting {filename}: {e}")
+
+# Start cleanup thread
+cleanup_thread = threading.Thread(target=clean_old_files, daemon=True)
+cleanup_thread.start()
+
+def get_video_info(url):
+    """Extract video information using yt-dlp"""
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return {
+                'title': info.get('title', 'Unknown Title'),
+                'thumbnail': info.get('thumbnail', ''),
+                'formats': [
+                    {
+                        'format_id': f.get('format_id'),
+                        'ext': f.get('ext', 'mp4'),
+                        'resolution': f.get('resolution', 'unknown'),
+                        'filesize': f.get('filesize', 0),
+                        'format_note': f.get('format_note', '')
+                    }
+                    for f in info.get('formats', [])
+                    if f.get('vcodec') != 'none'  # Only video formats
+                ]
+            }
+    except Exception as e:
+        return {'error': str(e)}
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    error = None
+    video_info = None
+    formats = None
+    url = ''
+    
+    if request.method == 'POST' and 'url' in request.form:
+        url = request.form.get('url')
+        video_info = get_video_info(url)
+        
+        if 'error' in video_info:
+            error = video_info['error']
+        else:
+            # Filter common resolutions
+            common_resolutions = ['144p', '240p', '360p', '480p', '720p', '1080p']
+            filtered_formats = []
+            for fmt in video_info['formats']:
+                if any(res in fmt['resolution'] for res in common_resolutions):
+                    filtered_formats.append(fmt)
+            
+            # Add audio-only option
+            audio_format = {
+                'format_id': 'bestaudio/best',
+                'ext': 'mp3',
+                'resolution': 'Audio Only',
+                'filesize': 0,
+                'format_note': 'MP3'
+            }
+            filtered_formats.append(audio_format)
+            
+            formats = filtered_formats
+    
+    # Render HTML template directly from string
+    return render_template_string('''
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>YouTube Downloader</title>
+        <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+        <style>
+            @media (max-width: 768px) {
+                .container {
+                    padding: 1rem;
+                }
+            }
+            body {
+                font-family: 'Inter', sans-serif;
+            }
+            input[type="radio"] {
+                accent-color: #4f46e5;
+            }
+            .loader {
+                display: inline-block;
+                width: 20px;
+                height: 20px;
+                border: 3px solid rgba(255,255,255,.3);
+                border-radius: 50%;
+                border-top-color: #fff;
+                animation: spin 1s ease-in-out infinite;
+            }
+            @keyframes spin {
+                to { transform: rotate(360deg); }
+            }
+        </style>
+    </head>
+    <body class="bg-gray-100 min-h-screen">
+        <div class="container mx-auto px-4 py-8 max-w-3xl">
+            <h1 class="text-3xl font-bold text-center mb-8 text-indigo-700">YouTube Downloader</h1>
+            
+            <div class="bg-white rounded-lg shadow-md p-6 mb-8">
+                <form method="POST">
+                    <div class="flex flex-col md:flex-row gap-4">
+                        <input 
+                            type="url" 
+                            name="url" 
+                            placeholder="Paste YouTube URL here" 
+                            class="flex-grow px-4 py-3 border rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                            required
+                            value="{{ url }}"
+                        >
+                        <button 
+                            type="submit" 
+                            class="px-6 py-3 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700 transition flex items-center justify-center"
+                            id="submit-btn"
+                        >
+                            <span id="btn-text">Get Video</span>
+                            <span id="btn-loader" class="loader ml-2 hidden"></span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+
+            {% if error %}
+                <div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 mb-6 rounded">
+                    <p class="font-medium">Error:</p>
+                    <p>{{ error }}</p>
+                </div>
+            {% endif %}
+
+            {% if video_info and formats %}
+            <div class="bg-white rounded-lg shadow-md overflow-hidden">
+                <div class="md:flex">
+                    {% if video_info.thumbnail %}
+                    <div class="md:w-1/3">
+                        <img 
+                            src="{{ video_info.thumbnail }}" 
+                            alt="{{ video_info.title }}"
+                            class="w-full h-full object-cover"
+                        >
+                    </div>
+                    {% endif %}
+                    
+                    <div class="p-6 md:w-2/3">
+                        <h2 class="text-xl font-semibold mb-4">{{ video_info.title }}</h2>
+                        
+                        <form method="POST" action="/download" id="download-form">
+                            <input type="hidden" name="url" value="{{ url }}">
+                            <input type="hidden" name="title" value="{{ video_info.title }}">
+                            
+                            <div class="mb-4">
+                                <label class="block text-gray-700 mb-2">Select format:</label>
+                                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                    {% for fmt in formats %}
+                                    <label class="flex items-center border rounded-lg p-3 hover:bg-gray-50 cursor-pointer">
+                                        <input 
+                                            type="radio" 
+                                            name="format_id" 
+                                            value="{{ fmt.format_id }}"
+                                            class="mr-3"
+                                            required
+                                        >
+                                        <div>
+                                            <div class="font-medium">{{ fmt.resolution }}</div>
+                                            <div class="text-sm text-gray-600">
+                                                {{ fmt.format_note if fmt.format_note else fmt.ext|upper }}
+                                                {% if fmt.filesize > 0 %}
+                                                - {{ (fmt.filesize / (1024*1024)) | round(1) }} MB
+                                                {% endif %}
+                                            </div>
+                                        </div>
+                                        <input 
+                                            type="hidden" 
+                                            name="extension" 
+                                            value="{{ fmt.ext }}"
+                                        >
+                                    </label>
+                                    {% endfor %}
+                                </div>
+                            </div>
+                            
+                            <button 
+                                type="submit" 
+                                class="w-full py-3 bg-green-600 text-white font-semibold rounded-lg hover:bg-green-700 transition flex items-center justify-center"
+                                id="download-btn"
+                            >
+                                <span id="download-text">Download</span>
+                                <span id="download-loader" class="loader ml-2 hidden"></span>
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+            {% endif %}
+        </div>
+        
+        <script>
+            document.querySelector('form').addEventListener('submit', function() {
+                const btn = document.getElementById('submit-btn');
+                const loader = document.getElementById('btn-loader');
+                const text = document.getElementById('btn-text');
+                
+                btn.disabled = true;
+                text.textContent = 'Processing...';
+                loader.classList.remove('hidden');
+            });
+            
+            const downloadForm = document.getElementById('download-form');
+            if (downloadForm) {
+                downloadForm.addEventListener('submit', function() {
+                    const btn = document.getElementById('download-btn');
+                    const loader = document.getElementById('download-loader');
+                    const text = document.getElementById('download-text');
+                    
+                    btn.disabled = true;
+                    text.textContent = 'Downloading...';
+                    loader.classList.remove('hidden');
+                });
+            }
+        </script>
+    </body>
+    </html>
+    ''', error=error, video_info=video_info, formats=formats, url=url)
+
+@app.route('/download', methods=['POST'])
+def download():
+    url = request.form.get('url')
+    format_id = request.form.get('format_id')
+    extension = request.form.get('extension', 'mp4')
+    title = request.form.get('title', 'video')
+    
+    # Sanitize filename
+    safe_title = re.sub(r'[^\w\s-]', '', title).strip()[:50]
+    timestamp = int(time.time())
+    filename = f"{safe_title}_{timestamp}.{extension}"
+    filepath = os.path.join(app.config['DOWNLOAD_FOLDER'], filename)
+    
+    ydl_opts = {
+        'format': format_id,
+        'outtmpl': filepath,
+        'quiet': True,
+        'no_warnings': True,
+    }
+    
+    # For audio, add post-processing to convert to mp3
+    if 'audio' in format_id.lower():
+        ydl_opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }]
+        filepath = filepath.replace('.mp4', '.mp3')
+        filename = filename.replace('.mp4', '.mp3')
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        
+        return send_file(
+            filepath,
+            as_attachment=True,
+            download_name=f"{safe_title}.{extension}"
+        )
+    except Exception as e:
+        return render_template_string('''
+        <div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 mb-6 rounded">
+            <p class="font-medium">Download failed:</p>
+            <p>{{ error }}</p>
+        </div>
+        <a href="/" class="px-4 py-2 bg-indigo-600 text-white rounded">Try Again</a>
+        ''', error=str(e))
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
